@@ -2,6 +2,8 @@
 
 English version: [README.md](README.md)
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23680401.svg)](https://doi.org/10.5281/zenodo.23680401)
+
 2.619 registros tirados das tabelas, figuras e do texto de 8 artigos em português impressos entre 1972 e 1989, um por doença ou indicador: um inquérito sorológico nacional de doença de Chagas em 1975-80, a detecção de hanseníase em Recife de 1960 a 1985 (PE), o estado nutricional de crianças menores de 5 anos em 3 municípios de Rondônia em 1985 (RO), a imunidade ao sarampo e a cobertura vacinal de crianças de 5 a 15 meses em Curitiba e São José dos Pinhais em 1983 (PR), um inquérito tuberculínico em escolares do primeiro ano em São Paulo em 1970 (SP), a mortalidade por causa no Distrito Federal em 1977-78 (DF), a malária em dois hospitais de Manaus em 1974-77 (AM) e o programa de controle da esquistossomose na Paraíba em 1978-85 (PB). Cada linha é uma célula impressa ou um número do texto, com a página e a tabela de onde saiu.
 
 Nenhum desses números existe em forma estruturada. As séries oficiais de saúde que estão online começam depois desses estudos: mortalidade (SIM) em 1979, as séries de notificação do SINAN para hanseníase, tuberculose e doença de Chagas aguda em 2001, cobertura vacinal (SI-PNI) em 1994, malária por estado em 1990 e nutrição infantil (SISVAN) em 2008. Nenhuma série tem sorologia, prova tuberculínica ou dado de prontuário hospitalar. Antes de ser transcrito, cada documento foi conferido nas séries que se aplicam a ele, no DataCite e no Harvard Dataverse, e o resultado de cada um está na tabela abaixo.

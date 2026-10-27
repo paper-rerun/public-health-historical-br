@@ -2,6 +2,8 @@
 
 Versão em português: [README.pt-BR.md](README.pt-BR.md)
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23680401.svg)](https://doi.org/10.5281/zenodo.23680401)
+
 2,619 records taken from the tables, figures and text of 8 articles printed in Portuguese between 1972 and 1989, one per disease or indicator: a national serosurvey of Chagas disease in 1975-80, leprosy detection in Recife from 1960 to 1985 (PE), the nutritional status of children under 5 in 3 municipalities of Rondônia in 1985 (RO), measles immunity and vaccine coverage of children aged 5 to 15 months in Curitiba and São José dos Pinhais in 1983 (PR), a tuberculin survey of first-year schoolchildren in São Paulo in 1970 (SP), mortality by cause in the Distrito Federal in 1977-78 (DF), malaria in two hospitals of Manaus in 1974-77 (AM) and the schistosomiasis control programme in Paraíba in 1978-85 (PB). Each row is one printed cell or one number of the text, with the page and table it came from.
 
 None of these numbers exists in structured form. The official health series that are online start after these studies: mortality (SIM) in 1979, the SINAN notification series for leprosy, tuberculosis and acute Chagas disease in 2001, vaccine coverage (SI-PNI) in 1994, malaria by state in 1990 and child nutrition (SISVAN) in 2008. No series holds serology, tuberculin tests or hospital records at all. Each document was checked against the relevant series and against DataCite and Harvard Dataverse before it was transcribed, and the result for each one is in the table below.
