@@ -1,0 +1,27 @@
+{
+  "title": "Historical public health data from Brazil, 1960-1985: 2,619 records from 8 publications (pilot)",
+  "upload_type": "dataset",
+  "description": "2,619 records transcribed from the tables, figures and text of 8 Portuguese-language journal articles printed between 1972 and 1989, one per disease or indicator: a national serosurvey of Chagas disease in 1975-80, leprosy detection in Recife from 1960 to 1985 (PE), the nutritional status of children under 5 in 3 municipalities of Rondônia in 1985 (RO), measles immunity and vaccine coverage of children aged 5 to 15 months in Curitiba and São José dos Pinhais in 1983 (PR), a tuberculin survey of first-year schoolchildren in São Paulo in 1970 (SP), mortality by cause in the Distrito Federal in 1977-78 (DF), malaria in two hospitals of Manaus in 1974-77 (AM) and the schistosomiasis control programme in Paraíba in 1978-85 (PB). Aggregated data only: counts, rates, percentages and means by place, age group, sex and year; a table that lists individual deaths was skipped. Records join 227 strata (study, place, age group, sex, population group, data source) on doc_id and stratum_ids. Labels, periods, conditions and units are kept exactly as printed. Printed totals are kept as records flagged as totals, never recomputed, and checked against their parts: of 522 totals, 420 can be checked, 407 add up exactly, 6 within rounding and 7 do not add up in the source. Rates printed next to their counts were recomputed: of 352, 322 match, 13 are one last digit off and 17 do not match in the source. Each document was checked as not available in structured form before transcription; the official online series start later (SIM 1979, malaria by state 1990, SI-PNI 1994, SINAN 2001, SISVAN 2008). Each document was transcribed twice, independently, by AI agents, and every disagreement was settled against the PDF; no digit was misread in the 2,619 paired records. A human reviewed the result before publication. Pilot of 8 documents; part of the Paper Rerun project (Open Tables).",
+  "creators": [
+    {
+      "name": "Tessaro, Filipe"
+    }
+  ],
+  "license": "cc-by-4.0",
+  "keywords": [
+    "public health",
+    "epidemiology",
+    "Chagas disease",
+    "leprosy",
+    "malaria",
+    "schistosomiasis",
+    "tuberculosis",
+    "measles",
+    "child nutrition",
+    "mortality",
+    "Brazil",
+    "historical data",
+    "open data",
+    "AI agents"
+  ]
+}
