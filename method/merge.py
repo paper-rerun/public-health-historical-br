@@ -1,7 +1,21 @@
 # Merge the adjudicated documents into records.csv, strata.csv and qa/decisions.csv, check the printed totals against their
 # parts (qa/totals_check.csv) and every rate printed next to its numerator and denominator (qa/rates_check.csv), and
-# print the pilot numbers for RODADA.md. Both checks are QA only: they never change the data
-# Usage: python -X utf8 method/merge.py   (paths are relative to the saude-piloto folder)
+# print the numbers for RODADA.md. Both checks are QA only: they never change the data
+# Usage: py -3.12 -I -X utf8 method/merge.py [--root DIR] [--out DIR] [--allow-missing-summary]
+#   --root: the round folder with sources.json, pdfs, A/, B/ and adjudicated/ (default: the folder above this script)
+#   --out: where the CSVs and qa/ go (default: --root)
+#   --allow-missing-summary: a document without adjudicated/<doc_id>_summary.json is merged without the pair check
+#   (only for the pilot test, whose adjudicators wrote no summary file)
+#
+# Schema 2.0 (saude-piloto/RODADA.md): the expected A/B pairs come from adjudicated/<doc_id>_summary.json (pairs,
+# a_error_rows, a_error_records, b_error_rows, b_error_records, change 11) instead of a table in this file, and the
+# summary's error counts are checked against the recount; a diff line that stands for a column of records (cascade_a_ids,
+# cascade_b_ids, change 10) counts every record it names; total_kind overall is a total that is not a sum and stays out
+# of the totals check (change 5); the long-copy search lives in check_long_copies.py, which the adjudicator also runs
+# (change 12); the round is judged on value and label accuracy and per-field accuracy, per-record accuracy is an alarm
+# (change 13). The adjudication provenance (origin, decision_ids, adjudicated_on, origin_rule) is read and kept. A new
+# document takes its licence from license_note in sources.json. Field lists come from the 2.0 schema next to this script;
+# the pilot's saude-1.0-pilot files are read too
 #
 # Adapted from pesca-piloto/method/merge.py for the public health pilot (schema saude-1.0-pilot). Changed: one kind of
 # record and no trials or species key. Records are written as adjudicated, with no inheritance, because rule 17 makes every
@@ -10,22 +24,41 @@
 # (pairing artifacts, X, R and S rows, 'paired by number') are not omissions. Records both sides wrote and the
 # adjudicator dropped (ferraroni1979 F001) count as extra records on both sides. The self-checks, the long-copy check and
 # the printed-totals check are kept; the rate check and the privacy scan are new
-import ast
 import csv
 import glob
 import json
 import os
 import re
-import subprocess
 import sys
 from collections import Counter, defaultdict
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "method"))
+HERE = os.path.dirname(os.path.abspath(__file__))
+SCHEMA_PATH = os.path.join(os.path.dirname(HERE), "schema.json")
+sys.path.insert(0, HERE)
 import compare  # noqa: E402  only for the compared field lists
-MAX_QUOTE_WORDS = 15
+from check_long_copies import MAX_QUOTE_WORDS, LoadPdfWordShingles, FindLongCopies, SelfCheck as LongCopySelfCheck  # noqa: E402
 
-# Licence situation per document, read from sources.json (licence)
+
+def Option(name, default=None):
+	# '--root DIR' and '--out DIR'
+	if name in sys.argv:
+		return os.path.abspath(sys.argv[sys.argv.index(name) + 1])
+	return default
+
+
+ROOT = Option("--root", os.path.dirname(HERE))
+OUT = Option("--out", ROOT)
+ALLOW_MISSING_SUMMARY = "--allow-missing-summary" in sys.argv
+SCHEMA_VERSIONS = ("2.0", "saude-1.0-pilot")
+# sources.json of the round of 20 kept the collection's own words for 3 kinds; the schema 2.0 enum has these
+SOURCE_KIND_TO_SCHEMA = {"notification_series": "surveillance_series", "hospital_records": "facility_records", "outbreak_investigation": "survey"}
+SUMMARY_FIELDS = ("pairs", "a_error_rows", "a_error_records", "b_error_rows", "b_error_records")
+# Change 13: the round passes on these two, per side; per-record accuracy only flags a cascade
+MIN_VALUE_LABEL_ACCURACY = 99.5
+MIN_FIELD_ACCURACY = 98.0
+
+# Licence situation per pilot document, read from sources.json (licence). A document of a later round takes license_note
+# from its sources.json entry
 SCIELO_BY_NC = "CC BY-NC 4.0 (página do artigo no SciELO, lida em 26/10/2026); o PDF não imprime licença"
 LICENSE = {
 	"camargo1984-chagas-inquerito-nacional-1975-1980": "CC BY 4.0 da revista inteira (página 'about' da Rev. Inst. Med. trop. São Paulo); sem licença do item; o PDF não imprime licença",
@@ -38,17 +71,6 @@ LICENSE = {
 	"coura1987-pece-esquistossomose-paraiba": SCIELO_BY_NC,
 }
 
-# Pairs and one-sided records per document in the adjudication summaries (A records - A only = B records - B only = pairs)
-EXPECTED = {
-	"camargo1984-chagas-inquerito-nacional-1975-1980": (99, 0, 3, 99),
-	"albuquerque1989-hanseniase-recife-1960-1985": (421, 0, 0, 421),
-	"ferreira1988-estado-nutricional-rondonia": (168, 0, 0, 168),
-	"rodriguez1984-sarampo-sorologia-curitiba-1983": (314, 3, 1, 315),
-	"certain1972-infeccao-tuberculosa-escolares-sp-1970": (415, 1, 0, 416),
-	"pereira1980-mortalidade-brasilia-1977-1978": (110, 0, 4, 112),
-	"ferraroni1979-malaria-amazonas-1972-1977": (657, 0, 0, 653),
-	"coura1987-pece-esquistossomose-paraiba": (435, 7, 0, 435),
-}
 # Kinds of decision row that pair again what compare.py left one-sided
 REPAIR_KINDS = {"cross_entry_pair", "paired_by_number", "manual_stratum_pair"}
 REPAIR_ID_PREFIXES = ("X", "R", "S")
@@ -86,72 +108,8 @@ DENOMINATOR_MEASURES = {"persons_examined", "population", "tests_done", "populat
 NUMERATOR_MEASURES = {"cases", "deaths", "positive_results", "negative_results", "persons_in_category", "vaccinated",
 	"immune_or_protected", "hospitalizations", "hospital_days", "persons_examined", "population"}
 
-# Quotes: 'x', "x", ‘x’, “x”. The single quote must not touch a letter, so "B's" is not a quote
-QUOTE_PATTERN = re.compile(r"(?<![\w])'([^']{3,}?)'(?![\w])|\"([^\"]{3,}?)\"|‘([^’]+)’|“([^”]+)”")
 # Privacy scan: a full date, a street or house, a birth date. Hits are printed for a person to read, not asserted away
 PRIVACY_PATTERN = re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b|\b(rua|avenida|travessa|logradouro|endereço|nascid[oa] em|data de nascimento)\b", re.IGNORECASE)
-
-
-def NormalizeWord(word):
-	return re.sub(r"^[^\w]+|[^\w]+$", "", word.lower())
-
-
-def LoadPdfWordShingles(pdf_path):
-	# Text layer of the whole PDF, with line-break hyphens joined, as a set of 16-word sequences
-	pdf_text = subprocess.run(["pdftotext", "-enc", "UTF-8", pdf_path, "-"], capture_output=True).stdout.decode("utf-8", "replace")
-	pdf_text = re.sub(r"-\s*\n\s*", "", pdf_text)
-	pdf_words = [NormalizeWord(word) for word in pdf_text.split()]
-	pdf_words = [word for word in pdf_words if word]
-	shingle_size = MAX_QUOTE_WORDS + 1
-	return {tuple(pdf_words[index:index + shingle_size]) for index in range(len(pdf_words) - shingle_size + 1)}
-
-
-def CopiedRuns(text, pdf_shingles):
-	# Word runs of the text found in the PDF text layer with more than MAX_QUOTE_WORDS words in a row
-	words = text.split()
-	normalized = [NormalizeWord(word) for word in words]
-	shingle_size = MAX_QUOTE_WORDS + 1
-	runs = []
-	index = 0
-	while index + shingle_size <= len(words):
-		if tuple(normalized[index:index + shingle_size]) in pdf_shingles and "" not in normalized[index:index + shingle_size]:
-			run_end = index + shingle_size
-			while run_end < len(words) and tuple(normalized[run_end - shingle_size + 1:run_end + 1]) in pdf_shingles:
-				run_end += 1
-			runs.append(" ".join(words[index:run_end]))
-			index = run_end
-		else:
-			index += 1
-	return runs
-
-
-def LongQuotes(text):
-	return [quoted for quoted in (next(group for group in match.groups() if group) for match in QUOTE_PATTERN.finditer(text))
-		if len(quoted.split()) > MAX_QUOTE_WORDS]
-
-
-def StringLeaves(value):
-	# A cell that holds a dict or list (JSON, or the Python repr the adjudicators wrote in a_value and b_value) is
-	# checked string by string: the quotes around each string are syntax, not a quotation of the source
-	if isinstance(value, str):
-		if value[:1] in "{[":
-			for parser in (json.loads, ast.literal_eval):
-				try:
-					return StringLeaves(parser(value))
-				except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
-					continue
-		return [value]
-	if isinstance(value, dict):
-		return [leaf for each_value in value.values() for leaf in StringLeaves(each_value)]
-	if isinstance(value, list):
-		return [leaf for each_value in value for leaf in StringLeaves(each_value)]
-	return []
-
-
-def FindLongCopies(text, pdf_shingles):
-	if not isinstance(text, str) or not text:
-		return []
-	return [copy for leaf in StringLeaves(text) for copy in CopiedRuns(leaf, pdf_shingles) + LongQuotes(leaf)]
 
 
 def BuildCitation(document):
@@ -432,7 +390,9 @@ def RateCheck(doc_id, records):
 		for record in same_row:
 			if record is not numerator and record["measure_standardized"] in DENOMINATOR_MEASURES and record["statistic"] == "count" and record["value"] is not None:
 				denominators.append(("row_" + record["measure_standardized"], record))
-		for record in same_table:
+		# The column total is the base of a share of the column only. A coefficient or prevalence over a column of cases has
+		# its base elsewhere (population, examined): in the round of 20, 311 of them came out 'differs' only for that
+		for record in same_table if rate["statistic"] == "percentage_share" else []:
 			if (record is not numerator and record["column_id"] == numerator["column_id"] and record["cell_part"] == numerator["cell_part"]
 					and record.get("total_kind") in ("column_total", "grand_total") and record["value"] is not None):
 				denominators.append(("column_total", record))
@@ -479,24 +439,37 @@ def RateCheck(doc_id, records):
 
 
 def main():
-	schema = json.load(open(os.path.join(ROOT, "schema.json"), encoding="utf-8"))
+	LongCopySelfCheck()
+	schema = json.load(open(SCHEMA_PATH, encoding="utf-8"))
 	defs = schema["$defs"]
 	sources = json.load(open(os.path.join(ROOT, "sources.json"), encoding="utf-8"))
 	documents_by_id = {document["id"]: document for document in sources["documents"]}
-	assert set(documents_by_id) == set(EXPECTED) == set(LICENSE)
 
 	shingles_by_doc = {}
 	stratum_rows, record_rows, totals_rows, rate_rows = [], [], [], []
 	stats = defaultdict(dict)
 	privacy_tables = []
-	for adjudicated_path in sorted(glob.glob(os.path.join(ROOT, "adjudicated", "*.json"))):
+	summaries, provenance = {}, {}
+	adjudicated_paths = [path for path in sorted(glob.glob(os.path.join(ROOT, "adjudicated", "*.json"))) if not path.endswith("_summary.json")]
+	for adjudicated_path in adjudicated_paths:
 		doc_id = os.path.basename(adjudicated_path)[:-5]
 		document = documents_by_id[doc_id]
 		shingles_by_doc[doc_id] = LoadPdfWordShingles(os.path.join(ROOT, document["pdf_path"]))
 		adjudicated = json.load(open(adjudicated_path, encoding="utf-8"))
-		assert adjudicated["doc_id"] == doc_id and adjudicated["document_kind"] == document["document_kind"], doc_id
-		assert adjudicated["schema_version"] == "saude-1.0-pilot", doc_id
-		citation, license_text = BuildCitation(document), LICENSE[doc_id]
+		assert adjudicated["doc_id"] == doc_id and adjudicated["document_kind"] == SOURCE_KIND_TO_SCHEMA.get(document["document_kind"], document["document_kind"]), doc_id
+		assert adjudicated["schema_version"] in SCHEMA_VERSIONS, (doc_id, adjudicated["schema_version"])
+		# The adjudicator's summary gives the pairs and both error counts of each side (change 11)
+		summary_path = os.path.join(ROOT, "adjudicated", doc_id + "_summary.json")
+		if os.path.exists(summary_path):
+			summary = json.load(open(summary_path, encoding="utf-8"))
+			missing = [field for field in SUMMARY_FIELDS if not isinstance(summary.get(field), int)]
+			assert not missing, f"{doc_id}: {summary_path} has no integer {missing}"
+			summaries[doc_id] = summary
+		else:
+			assert ALLOW_MISSING_SUMMARY, f"{doc_id}: no adjudicated/{doc_id}_summary.json with {', '.join(SUMMARY_FIELDS)}"
+		provenance[doc_id] = (adjudicated.get("adjudicated_on") or "", adjudicated.get("origin_rule") or "")
+		citation, license_text = BuildCitation(document), LICENSE.get(doc_id) or document.get("license_note")
+		assert license_text, f"{doc_id}: no licence text (license_note in sources.json)"
 
 		strata_by_id = {stratum["stratum_id"]: stratum for stratum in adjudicated["strata"]}
 		assert adjudicated["strata"][0]["stratum_dimension"] == "study", doc_id
@@ -560,13 +533,14 @@ def main():
 			skipped_cells=sum(table["skipped_cells"] for table in adjudicated["tables"]))
 
 	def WriteCsv(file_name, rows, columns=None):
-		columns = columns or list(rows[0].keys())
-		with open(os.path.join(ROOT, file_name), "w", encoding="utf-8", newline="") as output_file:
+		# A round with no checkable rate still writes the file, header only when there is no row
+		columns = columns or (list(rows[0].keys()) if rows else [])
+		with open(os.path.join(OUT, file_name), "w", encoding="utf-8", newline="") as output_file:
 			writer = csv.DictWriter(output_file, fieldnames=columns)
 			writer.writeheader()
 			writer.writerows(rows)
 
-	os.makedirs(os.path.join(ROOT, "qa"), exist_ok=True)
+	os.makedirs(os.path.join(OUT, "qa"), exist_ok=True)
 	WriteCsv("strata.csv", stratum_rows)
 	WriteCsv("records.csv", record_rows)
 	WriteCsv(os.path.join("qa", "totals_check.csv"), totals_rows)
@@ -613,9 +587,11 @@ def main():
 
 	# Per side and per category: field errors, omissions, extra entries, numbers and labels misread
 	field_errors_by_side = Counter()
+	value_label_wrong_by_doc = defaultdict(lambda: {"A": set(), "B": set()})
 	error_types = Counter()
 	error_examples = {}
 	misread_rows = []
+	summary_mismatches = []
 	for doc_id in stats:
 		a_document = json.load(open(os.path.join(ROOT, "A", doc_id + ".json"), encoding="utf-8"))
 		b_document = json.load(open(os.path.join(ROOT, "B", doc_id + ".json"), encoding="utf-8"))
@@ -631,6 +607,7 @@ def main():
 				repaired["B"].add(row["b_index"])
 		counts = Counter()
 		wrong = {(side, category): set() for side in "AB" for category in ("record", "stratum", "label", "inventory", "column")}
+		value_label_wrong = value_label_wrong_by_doc[doc_id]
 		for row in doc_rows:
 			counts["decision_" + row["decision"]] += 1
 			kind, field = row["kind"], row["field"]
@@ -675,9 +652,14 @@ def main():
 				continue
 			category = CategoryOf(row)
 			for side in SideOfError(row["decision"]):
-				counts[f"{side}_{category}_field_errors"] += 1
-				wrong[(side, category)].add(row[side.lower() + "_index"] or row["a_index"] or row["b_index"])
-				field_errors_by_side[(side, category, re.sub(r"^(columns\.[^.]+|table_level_labels)\.", "", field))] += 1
+				# A line for a whole column (change 10) names every record it stands for
+				cascade_ids = (row.get(f"cascade_{side.lower()}_ids") or "").split()
+				units = cascade_ids or [row[side.lower() + "_index"] or row["a_index"] or row["b_index"]]
+				counts[f"{side}_{category}_field_errors"] += len(units)
+				wrong[(side, category)].update(units)
+				field_errors_by_side[(side, category, re.sub(r"^(columns\.[^.]+|table_level_labels)\.", "", field))] += len(units)
+				if category == "record" and (field in NUMBER_FIELDS or field in LABEL_FIELDS):
+					value_label_wrong[side].update((doc_id, unit) for unit in units)
 				error_type = row[side.lower() + "_error_type"] or "(sem tipo)"
 				error_types[(side, error_type)] += 1
 				error_examples.setdefault((side, error_type), f"{doc_id[:14]} {row['table_or_figure']} {field}: {row['evidence'][:120]}")
@@ -692,13 +674,23 @@ def main():
 		for side in "AB":
 			# A table with a label, inventory or column error counts once
 			doc_stats[f"{side}_wrong_table"] = len(wrong[(side, "label")] | wrong[(side, "inventory")] | wrong[(side, "column")])
-		pairs, a_only, b_only, final = EXPECTED[doc_id]
 		doc_stats["pairs"] = doc_stats["a_records"] - counts["a_only_records"]
-		assert doc_stats["pairs"] == pairs == doc_stats["b_records"] - counts["b_only_records"], (doc_id, doc_stats["pairs"], counts["a_only_records"], counts["b_only_records"])
-		assert (counts["a_only_records"], counts["b_only_records"]) == (a_only, b_only), (doc_id, counts["a_only_records"], counts["b_only_records"])
+		assert doc_stats["pairs"] == doc_stats["b_records"] - counts["b_only_records"], (doc_id, doc_stats["pairs"], counts["a_only_records"], counts["b_only_records"])
+		if doc_id in summaries:
+			assert doc_stats["pairs"] == summaries[doc_id]["pairs"], (doc_id, "pairs", doc_stats["pairs"], "summary", summaries[doc_id]["pairs"])
+		pairs = doc_stats["pairs"]
 		# Every final record is a pair kept, or a record one side omitted
 		doc_stats["required"] = pairs - counts["dropped_pairs"] + counts["A_record_omitted"] + counts["B_record_omitted"] - counts["both_record_omitted"]
-		assert doc_stats["required"] == final == doc_stats["final"], (doc_id, doc_stats["required"], final, doc_stats["final"])
+		assert doc_stats["required"] == doc_stats["final"], (doc_id, doc_stats["required"], doc_stats["final"])
+		# The error counts of the summary against the recount: rows are decision lines against the side, records the
+		# distinct records of that side with a record-field line against it
+		doc_stats["a_error_rows"] = counts["decision_B_right"] + counts["decision_both_wrong"] + counts["decision_corrected"]
+		doc_stats["b_error_rows"] = counts["decision_A_right"] + counts["decision_both_wrong"] + counts["decision_corrected"]
+		doc_stats["a_error_records"], doc_stats["b_error_records"] = len(wrong[("A", "record")]), len(wrong[("B", "record")])
+		if doc_id in summaries:
+			for field in SUMMARY_FIELDS[1:]:
+				if summaries[doc_id][field] != doc_stats[field]:
+					summary_mismatches.append((doc_id, field, summaries[doc_id][field], doc_stats[field]))
 
 	totals = Counter()
 	print("doc_id;kind;final;pairs;strata;tables;A_rec;B_rec;A_wrong_rec;B_wrong_rec;A_omit;B_omit;A_extra;B_extra;"
@@ -734,7 +726,8 @@ def main():
 		largest = stats[largest_doc]
 		required_rest = required - largest["required"]
 		right_rest = required_rest - (omitted - largest.get(side + "_record_omitted", 0)) - (wrong_records - largest[side + "_wrong_record"])
-		print(f"{side} records without {largest_doc}: {right_rest}/{required_rest} = {100 * right_rest / required_rest:.1f}%")
+		if required_rest:
+			print(f"{side} records without {largest_doc}: {right_rest}/{required_rest} = {100 * right_rest / required_rest:.1f}%")
 		unit_total = totals["strata"]
 		unit_omitted = totals[f"{side}_stratum_omitted"]
 		wrong_units = totals[f"{side}_wrong_stratum"]
@@ -751,6 +744,22 @@ def main():
 			doc_stats = stats[doc_id]
 			right = doc_stats["required"] - doc_stats.get(side + "_record_omitted", 0) - doc_stats[side + "_wrong_record"]
 			print(f"   {side} {doc_id[:22]}: {right}/{doc_stats['required']} = {100 * right / doc_stats['required']:.1f}%")
+	# Change 13: value and label accuracy and per-field accuracy decide the round; per-record accuracy is the cascade alarm
+	pairs_total = sum(stats[doc_id]["pairs"] for doc_id in stats)
+	for side in ("A", "B"):
+		value_label_wrong = sum(len(value_label_wrong_by_doc[doc_id][side]) for doc_id in stats)
+		value_label_accuracy = 100 * (pairs_total - value_label_wrong) / pairs_total
+		field_accuracy = 100 * (1 - totals[side + "_record_field_errors"] / compared_fields)
+		record_accuracy = 100 * (totals["required"] - totals[side + "_record_omitted"] - totals[side + "_wrong_record"]) / totals["required"]
+		verdict = "PASS" if value_label_accuracy >= MIN_VALUE_LABEL_ACCURACY and field_accuracy >= MIN_FIELD_ACCURACY else "FAIL"
+		print(f"DECISION {side}: value and label {value_label_accuracy:.2f}% ({value_label_wrong} of {pairs_total} pairs, min {MIN_VALUE_LABEL_ACCURACY}%)"
+			f" | per field {field_accuracy:.2f}% (min {MIN_FIELD_ACCURACY}%) | {verdict} | per record {record_accuracy:.1f}% (alarm only)")
+	for doc_id in sorted(stats):
+		print(f"summary {doc_id}: pairs {stats[doc_id]['pairs']}", "(checked against the summary)" if doc_id in summaries else "(no summary, not checked)",
+			"| A rows/records", stats[doc_id]["a_error_rows"], stats[doc_id]["a_error_records"], "| B rows/records", stats[doc_id]["b_error_rows"], stats[doc_id]["b_error_records"],
+			f"| adjudicated_on {provenance[doc_id][0]} | origin_rule {provenance[doc_id][1][:80]}")
+	for mismatch in summary_mismatches:
+		print("  SUMMARY MISMATCH (doc, field, summary, recount):", mismatch)
 	print("field errors by side:", sorted(field_errors_by_side.items(), key=lambda item: -item[1])[:40])
 	print("error types by side:", sorted(error_types.items(), key=lambda item: -item[1]))
 	for key, example in sorted(error_examples.items()):
@@ -783,6 +792,7 @@ def main():
 	print("strata data_source_kind:", Counter(row["data_source_kind"] for row in stratum_rows), "place_kind:", Counter(row["place_kind"] for row in stratum_rows))
 	print("collected_by / cited_source (people check):", sorted({row["collected_by_as_printed"] for row in stratum_rows if row["collected_by_as_printed"]}
 		| {row["cited_source_as_printed"] for row in stratum_rows + record_rows if row["cited_source_as_printed"]}))
+	print("overall totals (not sums, change 5):", sum(1 for row in record_rows if row["total_kind"] == "overall"))
 	status_counts = Counter(row["status"] for row in totals_rows)
 	print("totals check:", len(totals_rows), status_counts, Counter(row["parts_read_as"] for row in totals_rows))
 	print("totals by doc and status:", sorted(Counter((row["doc_id"][:14], row["total_kind"], row["status"]) for row in totals_rows).items()))
@@ -812,17 +822,9 @@ def main():
 	assert all(f"{row['doc_id']}#{stratum_id}" in stratum_ids for row in record_rows for stratum_id in row["stratum_ids"].split("; "))
 	assert all(row["statistic"] and row["measure_standardized"] for row in record_rows)
 	assert len(decision_rows) == sum(sum(1 for _ in csv.DictReader(open(path, encoding="utf-8-sig"))) for path in glob.glob(os.path.join(ROOT, "adjudicated", "*_decisions.csv")))
+	assert not summary_mismatches, f"{len(summary_mismatches)} error counts of the adjudicator summaries differ from the recount (printed above)"
 	# Every printed sum in the records reaches the totals check
 	assert len(totals_rows) == sum(1 for row in record_rows if row["is_total"] is True and row["total_kind"] in SUM_KINDS)
-	# A 16-word copy is caught, a 15-word copy is not, and a 16-word quote is caught even when it is not in the PDF
-	test_words = [f"w{index}" for index in range(30)]
-	test_shingles = {tuple(test_words[index:index + MAX_QUOTE_WORDS + 1]) for index in range(len(test_words) - MAX_QUOTE_WORDS)}
-	assert CopiedRuns(" ".join(test_words[:16]) + " x", test_shingles) == [" ".join(test_words[:16])]
-	assert CopiedRuns(" ".join(test_words[:15]) + " x", test_shingles) == []
-	assert LongQuotes("as in '" + " ".join(["z"] * 16) + "' here") and not LongQuotes("B's and '" + " ".join(["z"] * 15) + "'")
-	# A dict repr with a long string of our own words is not a quote, but a long quote inside one of its strings still is
-	assert not FindLongCopies(repr({"notes": " ".join(["z"] * 16)}), set())
-	assert FindLongCopies(repr({"notes": "p3 says '" + " ".join(["z"] * 16) + "'"}), set())
 	assert PRIVACY_PATTERN.search("nascido em 12/03/1975") and not PRIVACY_PATTERN.search("1975/1980 e 1977/78")
 	# table_id on a record row (r51) is a record error, on a table row (k5) an inventory error; strata rows are strata
 	table_id_row = {"field": "table_id", "table_or_figure": "Tabela 2", "kind": "wording", "a_index": "r51", "b_index": "r51"}
@@ -871,6 +873,10 @@ def main():
 		TestRecord(2, "c4", 19.5, "Reatores / %", statistic="rate_or_proportion", measure="prevalence")]
 	rate_status = {row["record_id"]: (row["status"], row["denominator_kind"]) for row in RateCheck("t", rate_records)}
 	assert rate_status == {"t#1c4": ("agrees", "row_persons_examined"), "t#2c4": ("differs", "row_persons_examined")}, rate_status
+	# A coefficient over a column of cases is not checked against the column total
+	rate_records = [TestRecord(1, "c2", 10, "Casos", measure="cases"), TestRecord(1, "c3", 2.5, "Coef.", statistic="rate_or_proportion", measure="incidence_rate"),
+		TestRecord(2, "c2", 40, "Casos", "column_total", measure="cases")]
+	assert [row["status"] for row in RateCheck("t", rate_records)] == ["not_checkable_no_denominator"]
 	assert not long_copies, f"{len(long_copies)} cells copy more than {MAX_QUOTE_WORDS} words of the source: rewrite them in adjudicated/"
 
 

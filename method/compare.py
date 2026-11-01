@@ -1,7 +1,16 @@
-# Compare the two blind transcriptions of the public health pilot (A/*.json and B/*.json, schema saude-1.0-pilot:
-# {strata, tables, records, end_checklist})
-# Output: method/diff_<doc_id>.csv (or diff.csv for every doc in both folders) with strata disagreements first, then
-# table, label and column disagreements, then every record field disagreement and every record present on one side only
+# Compare the two blind transcriptions of a public health round (A/*.json and B/*.json, schema 2.0, also reads the
+# pilot's saude-1.0-pilot files: {strata, tables, records, end_checklist})
+# Output: diff_<doc_id>.csv (or diff.csv for every doc in both folders) with strata disagreements first, then table,
+# label and column disagreements, then every record field disagreement and every record present on one side only
+#
+# Schema 2.0 (saude-piloto/RODADA.md, change 10):
+# - text records left alone inside their entry pair by the number across every text entry of the same page; table_id and
+#   row_index are not compared between two text records, the inventory rows already say how the blocks differ
+# - an exact label match scores above a punctuation-free one, for strata and records: 'Masc' pairs with 'Masc' before
+#   'Masc.', '20-29' with '20-29' before '20 — 29' (ferraroni1979 lost 78 rows to cross pairs)
+# - a record field that differs the same way (same two values) in several records of one column is one line, with
+#   cascade_size and the A and B record ids; the adjudicator decides it once (coura1987 '1.ª' was 260 lines)
+# - --root and --out; the field lists come from the 2.0 schema next to this script (../schema.json) whatever --root is
 #
 # Adapted from pesca-piloto/method/compare.py. What changed for this schema:
 # - no trials and no species key; one record definition for every cell
@@ -13,7 +22,8 @@
 # - the prefix column says when one side's text is the start of the other's (biodiversity lesson 2)
 # - end_checklist is not compared, it is recomputed from the final records
 #
-# Usage: python compare.py [doc_id ...]   (paths are relative to this file); python compare.py --check runs the asserts
+# Usage: py -3.12 -I -X utf8 compare.py [doc_id ...] [--root DIR] [--out DIR]   (A/ and B/ under --root, default the folder
+# above this script; output to --out, default <root>/method); py -3.12 -I -X utf8 compare.py --check runs the asserts only
 import csv
 import difflib
 import glob
@@ -25,9 +35,6 @@ import unicodedata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-A_DIR = os.path.join(ROOT, "A")
-B_DIR = os.path.join(ROOT, "B")
-
 with open(os.path.join(ROOT, "schema.json"), encoding="utf-8") as schema_handle:
 	SCHEMA_DEFS = json.load(schema_handle)["$defs"]
 
@@ -140,6 +147,8 @@ def pair_strata(strata_a, strata_b):
 			score = 3.0 * similarity(stratum_a.get("stratum_label_as_printed"), stratum_b.get("stratum_label_as_printed"))
 			score += 1.0 if stratum_a.get("stratum_dimension") == stratum_b.get("stratum_dimension") else 0.0
 			score += 1.0 if norm(labels_a.get(stratum_a.get("parent_stratum_id"))) == norm(labels_b.get(stratum_b.get("parent_stratum_id"))) else 0.0
+			# Change 10: 'Masc' and 'Masc.' are two strata (rule 6), so the exact label wins over the punctuation-free one
+			score += 0.5 if exact(stratum_a.get("stratum_label_as_printed")) == exact(stratum_b.get("stratum_label_as_printed")) else 0.0
 			score += 0.1 if stratum_a["stratum_id"] == stratum_b["stratum_id"] else 0.0
 			if score >= 3.5:
 				candidates.append((score, stratum_a["stratum_id"], stratum_b["stratum_id"]))
@@ -224,7 +233,9 @@ def pair_tables(tables_a, tables_b):
 
 
 HEADER = ["diff_id", "doc_id", "page", "table_or_figure", "kind", "field", "a_index", "b_index", "label_a", "label_b",
-	"a_value", "b_value", "value_as_printed_a", "value_as_printed_b", "prefix", "match_score"]
+	"a_value", "b_value", "value_as_printed_a", "value_as_printed_b", "prefix", "match_score", "cascade_size", "cascade_a_ids", "cascade_b_ids"]
+# Fields not compared between two text records (change 10): the inventory rows already say how the text blocks differ
+TEXT_PAIR_SKIPPED = {"table_id", "row_index"}
 
 
 def row(doc_id, page, table_or_figure, kind, field, a_index, b_index, label_a="", label_b="", value_a="", value_b="",
@@ -234,7 +245,22 @@ def row(doc_id, page, table_or_figure, kind, field, a_index, b_index, label_a=""
 			return json.dumps(value, ensure_ascii=False, sort_keys=True)
 		return "" if value is None else value
 	return [doc_id, page, table_or_figure, kind, field, a_index, b_index, label_a, label_b, cell(value_a), cell(value_b),
-		cell(printed_a), cell(printed_b), prefix_flag(value_a, value_b), score]
+		cell(printed_a), cell(printed_b), prefix_flag(value_a, value_b), score, "", "", ""]
+
+
+def collapse_cascades(keyed_rows):
+	# One line per (A table, A column, cell part, field, value A, value B): a rule misread down a column is decided once
+	# (change 10). keyed_rows is [(key, row, a id, b id)] in record order; a line alone keeps its blank cascade columns
+	groups = {}
+	for key, out_row, id_a, id_b in keyed_rows:
+		groups.setdefault(key, []).append((out_row, id_a, id_b))
+	rows = []
+	for members in groups.values():
+		first_row = members[0][0]
+		if len(members) > 1:
+			first_row[-3:] = [len(members), " ".join(id_a for _, id_a, _ in members), " ".join(id_b for _, _, id_b in members)]
+		rows.append(first_row)
+	return rows
 
 
 def compare_tables(doc_id, data_a, data_b):
@@ -296,6 +322,7 @@ def record_pair_score(a, b):
 		score += 0.5 if a.get("row_index") == b.get("row_index") else 0.0
 		return score
 	score = 3.0 * similarity(a.get("row_label_as_printed"), b.get("row_label_as_printed"))
+	score += 0.5 if exact(a.get("row_label_as_printed")) == exact(b.get("row_label_as_printed")) else 0.0
 	score += 1.0 if a.get("column_id") == b.get("column_id") else 0.0
 	score += 0.5 if a.get("cell_part") == b.get("cell_part") else 0.0
 	score += 1.0 if a.get("row_index") == b.get("row_index") else 0.0
@@ -306,18 +333,18 @@ def record_pair_score(a, b):
 	return score
 
 
-def pair_records(records_a, records_b):
-	# Groups by (table, page); inside a group the best scores pair first, ties keep file order
+def pair_in_groups(records_a, records_b, indexes_a, indexes_b, group_of):
+	# Inside each group the best scores pair first, ties keep file order
 	groups = {}
-	for side, records in (("a", records_a), ("b", records_b)):
-		for index, record in enumerate(records):
-			groups.setdefault((str(record.get("table_id")), record.get("page") or 0), {"a": [], "b": []})[side].append(index)
+	for side, records, indexes in (("a", records_a, indexes_a), ("b", records_b, indexes_b)):
+		for index in indexes:
+			groups.setdefault(group_of(records[index]), {"a": [], "b": []})[side].append(index)
 	pairs, only_a, only_b = [], [], []
 	for key in sorted(groups):
-		indexes_a, indexes_b = groups[key]["a"], groups[key]["b"]
+		group_a, group_b = groups[key]["a"], groups[key]["b"]
 		candidates = []
-		for ia in indexes_a:
-			for ib in indexes_b:
+		for ia in group_a:
+			for ib in group_b:
 				score = record_pair_score(records_a[ia], records_b[ib])
 				if score >= MIN_RECORD_SCORE:
 					candidates.append((score, ia, ib))
@@ -329,9 +356,22 @@ def pair_records(records_a, records_b):
 			used_a.add(ia)
 			used_b.add(ib)
 			pairs.append((score, ia, ib))
-		only_a += [ia for ia in indexes_a if ia not in used_a]
-		only_b += [ib for ib in indexes_b if ib not in used_b]
-	return sorted(pairs, key=lambda p: p[1]), only_a, only_b
+		only_a += [ia for ia in group_a if ia not in used_a]
+		only_b += [ib for ib in group_b if ib not in used_b]
+	return pairs, only_a, only_b
+
+
+def pair_records(records_a, records_b):
+	# First inside (table, page); then the text records left alone pair across every text entry of their page (change 10:
+	# A and B split the same text into different blocks)
+	pairs, only_a, only_b = pair_in_groups(records_a, records_b, range(len(records_a)), range(len(records_b)),
+		lambda record: (str(record.get("table_id")), record.get("page") or 0))
+	text_a = [ia for ia in only_a if is_text(records_a[ia])]
+	text_b = [ib for ib in only_b if is_text(records_b[ib])]
+	text_pairs, text_only_a, text_only_b = pair_in_groups(records_a, records_b, text_a, text_b, lambda record: record.get("page") or 0)
+	only_a = sorted(set(only_a) - set(text_a) | set(text_only_a))
+	only_b = sorted(set(only_b) - set(text_b) | set(text_only_b))
+	return sorted(pairs + text_pairs, key=lambda p: p[1]), only_a, only_b
 
 
 def compare_strata(doc_id, strata_a, strata_b, original_b_ids):
@@ -352,11 +392,11 @@ def compare_strata(doc_id, strata_a, strata_b, original_b_ids):
 	return rows
 
 
-def compare_document(name):
+def compare_document(name, root=ROOT):
 	doc_id = name[:-5]
-	with open(os.path.join(A_DIR, name), encoding="utf-8") as handle:
+	with open(os.path.join(root, "A", name), encoding="utf-8") as handle:
 		data_a = json.load(handle)
-	with open(os.path.join(B_DIR, name), encoding="utf-8") as handle:
+	with open(os.path.join(root, "B", name), encoding="utf-8") as handle:
 		data_b = json.load(handle)
 	rows = []
 	for field in ("document_kind", "schema_version"):
@@ -371,13 +411,22 @@ def compare_document(name):
 	rows += compare_tables(doc_id, data_a, data_b)
 	records_a, records_b = data_a["records"], data_b["records"]
 	pairs, only_a, only_b = pair_records(records_a, records_b)
+	keyed_rows = []
 	for score, ia, ib in pairs:
 		a, b = records_a[ia], records_b[ib]
+		bTextPair = is_text(a) and is_text(b)
 		for field in RECORD_FIELDS:
+			if bTextPair and field in TEXT_PAIR_SKIPPED:
+				continue
 			if field_differs(field, a.get(field), b.get(field)):
-				rows.append(row(doc_id, a["page"], a["table_or_figure"], kind_of(field, a.get(field), b.get(field)), field,
+				out_row = row(doc_id, a["page"], a["table_or_figure"], kind_of(field, a.get(field), b.get(field)), field,
 					a["record_id"], b["record_id"], record_label(a), record_label(b), a.get(field), b.get(field),
-					a.get("value_as_printed"), b.get("value_as_printed"), round(score, 2)))
+					a.get("value_as_printed"), b.get("value_as_printed"), round(score, 2))
+				cascade_key = (a.get("table_id"), a.get("column_id"), a.get("cell_part"), field,
+					json.dumps(a.get(field), sort_keys=True, ensure_ascii=False), json.dumps(b.get(field), sort_keys=True, ensure_ascii=False))
+				keyed_rows.append((cascade_key, out_row, a["record_id"], b["record_id"]))
+	field_lines = len(keyed_rows)
+	rows += collapse_cascades(keyed_rows)
 	for ia in only_a:
 		a = records_a[ia]
 		rows.append(row(doc_id, a["page"], a["table_or_figure"], "only_in_A", "record", a["record_id"], "", record_label(a), "",
@@ -386,21 +435,24 @@ def compare_document(name):
 		b = records_b[ib]
 		rows.append(row(doc_id, b["page"], b["table_or_figure"], "only_in_B", "record", "", b["record_id"], "", record_label(b),
 			printed_b=b.get("value_as_printed")))
-	return rows, len(records_a), len(records_b), len(pairs)
+	return rows, len(records_a), len(records_b), len(pairs), field_lines
 
 
-def main(doc_ids):
+def main(doc_ids, root=ROOT, out_dir=None):
+	out_dir = out_dir or os.path.join(root, "method")
+	os.makedirs(out_dir, exist_ok=True)
 	if doc_ids:
 		names = [doc_id + ".json" for doc_id in doc_ids]
-		out_path = os.path.join(HERE, "diff_%s.csv" % doc_ids[0]) if len(doc_ids) == 1 else os.path.join(HERE, "diff_selected.csv")
+		out_path = os.path.join(out_dir, "diff_%s.csv" % doc_ids[0]) if len(doc_ids) == 1 else os.path.join(out_dir, "diff_selected.csv")
 	else:
-		names = sorted(os.path.basename(p) for p in glob.glob(os.path.join(A_DIR, "*.json")) if os.path.exists(os.path.join(B_DIR, os.path.basename(p))))
-		out_path = os.path.join(HERE, "diff.csv")
+		names = sorted(os.path.basename(p) for p in glob.glob(os.path.join(root, "A", "*.json")) if os.path.exists(os.path.join(root, "B", os.path.basename(p))))
+		out_path = os.path.join(out_dir, "diff.csv")
 	out_rows = []
 	for name in names:
-		rows, count_a, count_b, count_pairs = compare_document(name)
+		rows, count_a, count_b, count_pairs, field_lines = compare_document(name, root)
 		out_rows += rows
-		print("%s: A records %d, B records %d, matched pairs %d, diff rows %d" % (name[:-5], count_a, count_b, count_pairs, len(rows)))
+		print("%s: A records %d, B records %d, matched pairs %d, diff rows %d (record field differences %d before collapsing cascades)"
+			% (name[:-5], count_a, count_b, count_pairs, len(rows), field_lines))
 	with open(out_path, "w", encoding="utf-8", newline="") as handle:
 		writer = csv.writer(handle)
 		writer.writerow(HEADER)
@@ -445,9 +497,35 @@ def self_check():
 	tables_a = [{"table_id": "k10", "page": 6, "label": "text", "kind": "statistical_tests"}, {"table_id": "k11", "page": 6, "label": "text", "kind": "text"}]
 	tables_b = [{"table_id": "k11", "page": 6, "label": "text", "kind": "text"}]
 	assert pair_tables(tables_a, tables_b) == {"k11": "k11"}
+	# Change 10: the exact label wins. A has 'Masc' and 'Masc.' as two strata, B the same two in the other order
+	strata_a = [{"stratum_id": "s1", "parent_stratum_id": None, "stratum_dimension": "study", "stratum_label_as_printed": None},
+		{"stratum_id": "s2", "parent_stratum_id": "s1", "stratum_dimension": "sex", "stratum_label_as_printed": "Masc"},
+		{"stratum_id": "s3", "parent_stratum_id": "s1", "stratum_dimension": "sex", "stratum_label_as_printed": "Masc."}]
+	strata_b = [dict(strata_a[0]), dict(strata_a[2], stratum_id="s2"), dict(strata_a[1], stratum_id="s3")]
+	assert pair_strata(strata_a, strata_b) == {"s1": "s1", "s2": "s3", "s3": "s2"}
+	# Change 10: text records pair by the number across two text entries of the same page
+	text_a = [{"table_id": "k10", "page": 6, "table_or_figure": "text", "row_index": 1, "row_label_as_printed": "de 120 crianças vacinadas", "value_as_printed": "120"}]
+	text_b = [{"table_id": "k11", "page": 6, "table_or_figure": "text", "row_index": 3, "row_label_as_printed": "de 120 crianças vacinadas", "value_as_printed": "120"}]
+	pairs, only_a, only_b = pair_records(text_a, text_b)
+	assert [(ia, ib) for score, ia, ib in pairs] == [(0, 0)] and not only_a and not only_b
+	# Change 10: the same difference down a column is one line with every record; another column stays apart
+	keyed_rows = [(("k1", "c2", "whole", "measure_as_printed", "a", "b"), row("d", 3, "Tabela 1", "wording", "measure_as_printed", "r%d" % number, "r%d" % number), "r%d" % number, "r%d" % number)
+		for number in (1, 2, 3)]
+	keyed_rows.append((("k1", "c3", "whole", "measure_as_printed", "a", "b"), row("d", 3, "Tabela 1", "wording", "measure_as_printed", "r4", "r4"), "r4", "r4"))
+	collapsed = collapse_cascades(keyed_rows)
+	assert len(collapsed) == 2 and collapsed[0][-3:] == [3, "r1 r2 r3", "r1 r2 r3"] and collapsed[1][-3:] == ["", "", ""]
+
+
+def option(name, default=None):
+	# '--root DIR' and '--out DIR'
+	if name in sys.argv:
+		return sys.argv[sys.argv.index(name) + 1]
+	return default
 
 
 if __name__ == "__main__":
 	self_check()
 	if "--check" not in sys.argv:
-		main([arg for arg in sys.argv[1:] if not arg.startswith("--")])
+		root, out_dir = os.path.abspath(option("--root", ROOT)), option("--out")
+		values = {option("--root"), option("--out")}
+		main([arg for arg in sys.argv[1:] if not arg.startswith("--") and arg not in values], root, out_dir and os.path.abspath(out_dir))
